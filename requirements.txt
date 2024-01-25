@@ -2,3 +2,4 @@ arraylake
 torch
 typer
 xarray
+gcsfs
