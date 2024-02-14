@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Optional, Callable, Union
+from typing import Optional
 
 import dask
 import torch
@@ -14,9 +14,13 @@ from typing_extensions import Annotated
 
 from dask.cache import Cache
 
-T_DataArrayOrSet = Union[xr.Dataset, xr.DataArray]
-
-cache = Cache(1e10)  # 10gb cache
+# torch.multiprocessing.set_sharing_strategy('file_descriptor')
+fast = {}
+# slow = zict.Func(pickle.dumps, pickle.loads, zict.File('storage/'))
+# def weight(k, v):
+#     return sys.getsizeof(v)
+# cache_data = zict.Buffer(fast, slow, 1e9, weight=weight) # 1gb in-memory cache
+cache = Cache(1e10, cache_data=fast)  # 10gb cache, split between in-memory and file storage
 cache.register()
 
 
@@ -25,18 +29,13 @@ def print_json(obj):
 
 
 class XBatcherPyTorchDataset(TorchDataset):
-    def __init__(
-        self,
-        batch_generator: xbatcher.BatchGenerator,
-        post_process: Optional[Callable[[T_DataArrayOrSet], torch.Tensor]] = None,
-    ):
-        self._bgen = batch_generator
-        self._post_process = post_process
+    def __init__(self, batch_generator: xbatcher.BatchGenerator):
+        self.bgen = batch_generator
 
-    def __len__(self) -> int:
-        return len(self._bgen)
+    def __len__(self):
+        return len(self.bgen)
 
-    def __getitem__(self, idx) -> torch.Tensor:
+    def __getitem__(self, idx):
         t0 = time.time()
         print_json(
             {
@@ -47,11 +46,16 @@ class XBatcherPyTorchDataset(TorchDataset):
             }
         )
         # load before stacking
-        batch = self._bgen[idx].load()
+        batch = self.bgen[idx].load()
 
-        if self._post_process:
-            batch = self._post_process(batch)
-
+        # Use to_stacked_array to stack without broadcasting,
+        # zeus' dataset.preprocess_inputs merges the "variable" and "level" dimensions
+        # and likes this order: "time", "batch", "longitude", "latitude"
+        # Hmm... This will be slow, since it constructs a multiindex.
+        stacked = batch.to_stacked_array(
+            new_dim="batch", sample_dims=("time", "longitude", "latitude")
+        ).transpose("time", "batch", ...)
+        x = torch.tensor(stacked.data)
         t1 = time.time()
         print_json(
             {
@@ -62,22 +66,10 @@ class XBatcherPyTorchDataset(TorchDataset):
                 "duration": t1 - t0,
             }
         )
-
-        return batch
-
-
-def post_process_batch(batch: T_DataArrayOrSet) -> torch.Tensor:
-    stacked = batch.to_stacked_array(
-        new_dim="batch", sample_dims=("time", "longitude", "latitude")
-    ).transpose("time", "batch", ...)
-
-    # convert to torch tensor
-    return torch.tensor(stacked.data)
+        return x
 
 
-def setup(
-    patch_size: int = 48, input_steps: int = 3, output_steps: int = 0
-) -> XBatcherPyTorchDataset:
+def setup(patch_size: int = 32, input_steps: int = 3, output_steps: int = 0, jitter: int = 16):
     # client = Client()
     # # set s3 endpoint for GCS + anonymous access
     # config.set({"s3.endpoint_url": "https://storage.googleapis.com", "s3.anon": True})
@@ -94,13 +86,13 @@ def setup(
     DEFAULT_VARS = [
         "10m_wind_speed",
         "2m_temperature",
-        "specific_humidity",
+        "specific_humidity",  # Q(JH): this field has a a "level" dimension, how is that treated?
     ]
 
     ds = ds[DEFAULT_VARS]
     patch = dict(
-        latitude=patch_size,
-        longitude=patch_size,
+        latitude=patch_size + jitter,
+        longitude=patch_size + jitter,
         time=input_steps + output_steps,
     )
     overlap = dict(latitude=32, longitude=32, time=input_steps // 3 * 2)
@@ -112,7 +104,7 @@ def setup(
         preload_batch=False,
     )
 
-    dataset = XBatcherPyTorchDataset(bgen, post_process=post_process_batch)
+    dataset = XBatcherPyTorchDataset(bgen)
 
     return dataset
 
@@ -139,15 +131,15 @@ def main(
         data_params["shuffle"] = shuffle
     if num_workers is not None:
         data_params["num_workers"] = num_workers
-    #     if multiprocessing_context is None:
-    #         data_params["multiprocessing_context"] = "forkserver"
-    # if multiprocessing_context is not None:
-    #     if multiprocessing_context == "loky":
-    #         from joblib.externals.loky.backend.context import get_context
+        if multiprocessing_context is None:
+            data_params["multiprocessing_context"] = "forkserver"
+    if multiprocessing_context is not None:
+        if multiprocessing_context == "loky":
+            from joblib.externals.loky.backend.context import get_context
 
-    #         data_params["multiprocessing_context"] = get_context("loky")
-    #     else:
-    #         data_params["multiprocessing_context"] = multiprocessing_context
+            data_params["multiprocessing_context"] = get_context("loky")
+        else:
+            data_params["multiprocessing_context"] = multiprocessing_context
     if prefetch_factor is not None:
         data_params["prefetch_factor"] = prefetch_factor
     if persistent_workers is not None:
@@ -176,8 +168,8 @@ def main(
     t0 = time.time()
     print_json({"event": "setup start", "time": t0})
     dataset = setup()
-    data_loader = DataLoader(dataset, **data_params)
-    _ = next(iter(data_loader))  # wait until dataloader is ready
+    training_generator = DataLoader(dataset, **data_params)
+    _ = next(iter(training_generator))  # wait until dataloader is ready
     t1 = time.time()
     print_json({"event": "setup end", "time": t1, "duration": t1 - t0})
 
@@ -185,7 +177,7 @@ def main(
         e0 = time.time()
         print_json({"event": "epoch start", "epoch": epoch, "time": e0})
 
-        for i, _ in enumerate(data_loader):
+        for i, sample in enumerate(training_generator):
             tt0 = time.time()
             print_json({"event": "training start", "batch": i, "time": tt0})
             time.sleep(train_step_time)  # simulate model training
