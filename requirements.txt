@@ -1,0 +1,10 @@
+cachey
+dask
+gcsfs
+matplotlib
+numpy
+seaborn
+torch
+typer
+xarray
+xbatcher
