@@ -1,0 +1,2 @@
+[core]
+    sshCommand = ssh -i ~/.ssh/swonderine -F /dev/null
