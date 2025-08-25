@@ -2,4 +2,7 @@ arraylake
 torch
 typer
 xarray
+xbatcher
 gcsfs
+dask
+zict
